@@ -485,8 +485,8 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     }
 
     memmove(mem, (char*)pa, PGSIZE);
-    
-    if(vm_map_range(new, i, PGSIZE, flags) != 0)
+
+    if(vm_page_insert(new, i, mem, flags) != 0)
     {
       vm_page_free(mem);
       goto err;
@@ -572,6 +572,10 @@ proc_free_pagetable(pagetable_t pagetable, uint64 sz)
       vm_page_remove(pagetable, TRAPFRAME, 1, 0);
 
       // Remove all user memory pages and free user page table
+      if(sz > 0)
+      {
+        vm_page_remove(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+      }
       proc_freewalk(pagetable);
 }
 
