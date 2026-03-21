@@ -273,6 +273,7 @@ proc_load_elf(struct proc *p, void *bin)
     {
       goto bad;
     }
+    printf("This ELF image contains %d headers.\n", elf.phnum);
 
     // 2. Iterate through all program headers in the elf object
     for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph))
@@ -315,13 +316,50 @@ proc_load_elf(struct proc *p, void *bin)
       sz = sz1;
 
       // Load the segment into user memory
+      printf("Loading segment of size %d at %p\n", ph.filesz, ph.vaddr + ph.off);
+      printf("  va: %p\n  va + sz: %p\n", ph.vaddr, ph.vaddr + ph.filesz);
       if(proc_loadseg(pagetable, ph.vaddr, bin, ph.off, ph.filesz) < 0)
       {
         goto bad;
       }
   }
 
+  // 3. Set up the user stack
   uint64 oldsz = p->sz;
+
+  // Add 2 pages to the pagetable for the userstack
+  printf("Creating the user stack...\n");
+  sz = PGROUNDUP(sz);
+  if((sz1 = proc_resize(pagetable, sz, sz + (2*PGSIZE))) == 0)
+  {
+    goto bad;
+  }
+  sz = sz1;
+
+  // Make the first page a guard page by marking it as invalid
+  proc_guard(pagetable, sz-(2*PGSIZE));
+
+  // Set the stack pointer
+  sp = sz;
+  printf("User Stack Created Successfully...\n");
+
+  // 4. Destroy the old pagetable
+  pagetable_t oldpagetable = p->pagetable;
+  p->pagetable = pagetable;
+  proc_free_pagetable(oldpagetable, oldsz);
+  
+  // 5. Commit to the user image
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
+  p->trapframe->sp = sp; // initial stack pointer
+
+  printf("Entry Point: %p\n", elf.entry);
+  pte_t* pte = walk_pgtable(pagetable, elf.entry, 0);
+  printf("Entry point *pte: %p\n", *pte);
+
+  // 6. Mark the process as runnable
+  p->state = RUNNABLE;
+  return 0;
 
 bad:
     if(pagetable)
@@ -341,15 +379,15 @@ bad:
 uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz) 
 {
     // Make this behave as above. This is a little bit different from the
-    // xv6 equivalent. What did I change? *You combined three functions from xv6!
+    // xv6 equivalent. What did I change?
     //
-
+    printf("resize from %d to %d\n", oldsz, newsz);
     // Page address and physical page address
     uint64 addr;
     void* pa;
 
     // Permissions of new memory
-    int perm = PTE_U | PTE_R | PTE_W;
+    int perm = PTE_W | PTE_R | PTE_X | PTE_V | PTE_U;
 
     // Process must grow
     if(newsz > oldsz)
@@ -370,13 +408,14 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
         if((pa = vm_page_alloc()) == 0)
         {
           // Reduce to original size and return as error
-          proc_resize(pagetable, addr, oldsz);
+          proc_shrink(pagetable, addr, oldsz);
           return 0;
         }
 
         // Set all of the new page to zero
         memset(pa, 0, PGSIZE);
-
+        printf("  pte of mapped page using walk_pgtable: %p\n", walk_pgtable(pagetable, addr, 0));
+        printf("  mapping page at %p...\n", addr);
         // Attempt to insert the new page into the proccesses pagetable
         if(vm_page_insert(pagetable, addr, (uint64) pa, perm) == -1)
         {
@@ -392,7 +431,10 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     } 
 
     // Process must shrink
-    proc_shrink(pagetable, oldsz, newsz);
+    if (newsz < oldsz)
+    {
+      proc_shrink(pagetable, oldsz, newsz);
+    }
 
     // Return the new size that the process has been shrunk to
     return newsz;
@@ -593,12 +635,26 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
   //   bin+offset+i
   // As an added hint, I have included my variable declarations 
   // above.
+
+  printf("proc_loadseg():\n");
+  printf("  pagetable:          %p\n", pagetable);
+  printf("  va (dst):           %p\n", va);
+  printf("  bin:                %p\n", bin);
+  printf("  offset:             %p\n", offset);
+  printf("  sz:                 %d\n", sz);
+  printf("| bin + offset (src): %p\n", bin+offset);
+  printf("| va + sz (max-addr): %p\n\n", va + sz);
   
   // Iterate every page of the data to load
   for(i = 0; i < sz; i += PGSIZE)
   {
     // Get the physical address of the page
-    pa = (uint64) walk_pgtable(pagetable, va + i, 0);
+    pte_t* pte = walk_pgtable(pagetable, va + i, 0);
+    pa = PTE2PA(*pte);
+
+    printf("  - pte        %p: %p\n", pte);
+    printf("  - va of page %d: %p\n", i, va + i);
+    printf("  - pa of page %d: %p\n\n", i, pa);
 
     // If the address is zero, panic
     if(pa == 0)
@@ -615,11 +671,7 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
       n = PGSIZE;
     }
 
-
-    if(memmove((void*) pa, bin+offset+i, n) == 0)
-    {
-      return -1;
-    }
+    memmove((void*) pa, (char*) bin+offset+i, n);
   }
   
   return 0;
